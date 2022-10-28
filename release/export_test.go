@@ -19,10 +19,29 @@
 
 package release
 
-func HackLsbReleasePath(fn string) (reset func()) {
-	origLsbReleasePath := lsbReleasePath
-	lsbReleasePath = fn
+var (
+	ReadOSRelease = readOSRelease
+)
+
+func MockOSReleasePath(filename string) (restore func()) {
+	old := osReleasePath
+	oldFallback := fallbackOsReleasePath
+	osReleasePath = filename
+	fallbackOsReleasePath = filename
 	return func() {
-		lsbReleasePath = origLsbReleasePath
+		osReleasePath = old
+		fallbackOsReleasePath = oldFallback
 	}
 }
+
+func MockIoutilReadfile(newReadfile func(string) ([]byte, error)) (restorer func()) {
+	old := ioutilReadFile
+	ioutilReadFile = newReadfile
+	return func() {
+		ioutilReadFile = old
+	}
+}
+
+var (
+	IsWSL = isWSL
+)

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2015 Canonical Ltd
+ * Copyright (C) 2014,2015,2017 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -20,13 +20,14 @@
 package logger
 
 import (
+	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"log/syslog"
 	"os"
 	"sync"
+
+	"github.com/snapcore/snapd/osutil"
 )
 
 // A Logger is a fairly minimal logging tool.
@@ -40,10 +41,6 @@ type Logger interface {
 const (
 	// DefaultFlags are passed to the default console log.Logger
 	DefaultFlags = log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile
-	// SyslogFlags are passed to the default syslog log.Logger
-	SyslogFlags = log.Lshortfile
-	// SyslogPriority for the default syslog log.Logger
-	SyslogPriority = syslog.LOG_DEBUG | syslog.LOG_USER
 )
 
 type nullLogger struct{}
@@ -90,6 +87,30 @@ func Debugf(format string, v ...interface{}) {
 	logger.Debug(msg)
 }
 
+// MockLogger replaces the exiting logger with a buffer and returns
+// the log buffer and a restore function.
+func MockLogger() (buf *bytes.Buffer, restore func()) {
+	buf = &bytes.Buffer{}
+	oldLogger := logger
+	l, err := New(buf, DefaultFlags)
+	if err != nil {
+		panic(err)
+	}
+	SetLogger(l)
+	return buf, func() {
+		SetLogger(oldLogger)
+	}
+}
+
+// WithLoggerLock invokes f with the global logger lock, useful for
+// tests involving goroutines with MockLogger.
+func WithLoggerLock(f func()) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	f()
+}
+
 // SetLogger sets the global logger to the given one
 func SetLogger(l Logger) {
 	lock.Lock()
@@ -98,54 +119,58 @@ func SetLogger(l Logger) {
 	logger = l
 }
 
-// ConsoleLog sends Notices to a log.Logger and Debugs to syslog
-type ConsoleLog struct {
+type Log struct {
 	log *log.Logger
-	sys *log.Logger
+
+	debug bool
 }
 
-// Debug sends the msg to syslog
-func (l *ConsoleLog) Debug(msg string) {
-	l.sys.Output(3, "DEBUG: "+msg)
+// Debug only prints if SNAPD_DEBUG is set
+func (l *Log) Debug(msg string) {
+	if l.debug || osutil.GetenvBool("SNAPD_DEBUG") {
+		l.log.Output(3, "DEBUG: "+msg)
+	}
 }
 
 // Notice alerts the user about something, as well as putting it syslog
-func (l *ConsoleLog) Notice(msg string) {
-	l.sys.Output(3, msg)
+func (l *Log) Notice(msg string) {
 	l.log.Output(3, msg)
 }
 
-// variable to allow mocking the syslog.NewLogger call in the tests
-var newSyslog = newSyslogImpl
-
-func newSyslogImpl() (*log.Logger, error) {
-	return syslog.NewLogger(SyslogPriority, SyslogFlags)
-}
-
-// NewConsoleLog creates a ConsoleLog with a log.Logger using the given
-// io.Writer and flag, and a syslog.Writer.
-func NewConsoleLog(w io.Writer, flag int) (*ConsoleLog, error) {
-	clog := log.New(w, "", flag)
-
-	sys, err := newSyslog()
-	if err != nil {
-		clog.Output(3, "WARNING: can not create syslog logger")
-		sys = log.New(ioutil.Discard, "", flag)
+// New creates a log.Logger using the given io.Writer and flag.
+func New(w io.Writer, flag int) (Logger, error) {
+	logger := &Log{
+		log:   log.New(w, "", flag),
+		debug: debugEnabledOnKernelCmdline(),
 	}
-
-	return &ConsoleLog{
-		log: clog,
-		sys: sys,
-	}, nil
+	return logger, nil
 }
 
 // SimpleSetup creates the default (console) logger
 func SimpleSetup() error {
-	l, err := NewConsoleLog(os.Stderr, DefaultFlags)
-	if err != nil {
-		return err
+	flags := log.Lshortfile
+	if term := os.Getenv("TERM"); term != "" {
+		// snapd is probably not running under systemd
+		flags = DefaultFlags
 	}
-	SetLogger(l)
+	l, err := New(os.Stderr, flags)
+	if err == nil {
+		SetLogger(l)
+	}
+	return err
+}
 
-	return nil
+// used to force testing of the kernel command line parsing
+var procCmdlineUseDefaultMockInTests = true
+
+// TODO: consider generalizing this to snapdenv and having it used by
+// other places that consider SNAPD_DEBUG
+func debugEnabledOnKernelCmdline() bool {
+	// if this is called during tests, always ignore it so we don't have to mock
+	// the /proc/cmdline for every test that ends up using a logger
+	if osutil.IsTestBinary() && procCmdlineUseDefaultMockInTests {
+		return false
+	}
+	m, _ := osutil.KernelCommandLineKeyValues("snapd.debug")
+	return m["snapd.debug"] == "1"
 }

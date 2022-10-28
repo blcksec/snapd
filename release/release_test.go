@@ -26,7 +26,7 @@ import (
 
 	. "gopkg.in/check.v1"
 
-	"github.com/ubuntu-core/snappy/release"
+	"github.com/snapcore/snapd/release"
 )
 
 // Hook up check.v1 into the "go test" runner
@@ -38,52 +38,154 @@ type ReleaseTestSuite struct {
 var _ = Suite(&ReleaseTestSuite{})
 
 func (s *ReleaseTestSuite) TestSetup(c *C) {
-	c.Assert(release.Setup(c.MkDir()), IsNil)
-	c.Check(release.String(), Equals, "rolling-core")
-	rel := release.Get()
-	c.Check(rel.Flavor, Equals, "core")
-	c.Check(rel.Series, Equals, "rolling")
-	c.Check(rel.Channel, Equals, "edge")
+	c.Check(release.Series, Equals, "16")
 }
 
-func (s *ReleaseTestSuite) TestOverride(c *C) {
-	rel := release.Release{Flavor: "personal", Series: "10.06", Channel: "beta"}
-	release.Override(rel)
-	c.Check(release.String(), Equals, "10.06-personal")
-	c.Check(release.Get(), DeepEquals, rel)
-}
-
-func makeMockLsbRelease(c *C) string {
+func mockOSRelease(c *C) string {
 	// FIXME: use AddCleanup here once available so that we
-	//        can do release.SetLsbReleasePath() here directly
-	mockLsbRelease := filepath.Join(c.MkDir(), "mock-lsb-release")
+	//        can do release.SetLSBReleasePath() here directly
+	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
 	s := `
-DISTRIB_ID=Ubuntu
-DISTRIB_RELEASE=18.09
-DISTRIB_CODENAME=awsome
-DISTRIB_DESCRIPTION=I'm not real!
+NAME="Ubuntu"
+VERSION="18.09 (Awesome Artichoke)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="I'm not real!"
+VERSION_ID="18.09"
+HOME_URL="http://www.ubuntu.com/"
+SUPPORT_URL="http://help.ubuntu.com/"
+BUG_REPORT_URL="http://bugs.launchpad.net/ubuntu/"
 `
-	err := ioutil.WriteFile(mockLsbRelease, []byte(s), 0644)
+	err := ioutil.WriteFile(mockOSRelease, []byte(s), 0644)
 	c.Assert(err, IsNil)
 
-	return mockLsbRelease
+	return mockOSRelease
 }
 
-func (a *ReleaseTestSuite) TestReadLsb(c *C) {
-	reset := release.HackLsbReleasePath(makeMockLsbRelease(c))
+func (s *ReleaseTestSuite) TestReadOSRelease(c *C) {
+	reset := release.MockOSReleasePath(mockOSRelease(c))
 	defer reset()
 
-	lsb, err := release.ReadLsb()
+	os := release.ReadOSRelease()
+	c.Check(os.ID, Equals, "ubuntu")
+	c.Check(os.VersionID, Equals, "18.09")
+}
+
+func (s *ReleaseTestSuite) TestReadWonkyOSRelease(c *C) {
+	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
+	dump := `NAME="elementary OS"
+VERSION="0.4 Loki"
+ID="elementary OS"
+ID_LIKE=ubuntu
+PRETTY_NAME="elementary OS Loki"
+VERSION_ID="0.4"
+HOME_URL="http://elementary.io/"
+SUPPORT_URL="http://elementary.io/support/"
+BUG_REPORT_URL="https://bugs.launchpad.net/elementary/+filebug"`
+	err := ioutil.WriteFile(mockOSRelease, []byte(dump), 0644)
 	c.Assert(err, IsNil)
-	c.Assert(lsb.ID, Equals, "Ubuntu")
-	c.Assert(lsb.Release, Equals, "18.09")
-	c.Assert(lsb.Codename, Equals, "awsome")
-}
 
-func (a *ReleaseTestSuite) TestReadLsbNotFound(c *C) {
-	reset := release.HackLsbReleasePath("not-there")
+	reset := release.MockOSReleasePath(mockOSRelease)
 	defer reset()
 
-	_, err := release.ReadLsb()
-	c.Assert(err, ErrorMatches, "cannot read lsb-release:.*")
+	os := release.ReadOSRelease()
+	c.Check(os.ID, Equals, "elementary")
+	c.Check(os.VersionID, Equals, "0.4")
+}
+
+func (s *ReleaseTestSuite) TestFamilyOSRelease(c *C) {
+	mockOSRelease := filepath.Join(c.MkDir(), "mock-os-release")
+	dump := `NAME="CentOS Linux"
+VERSION="7 (Core)"
+ID="centos"
+ID_LIKE="rhel fedora"
+VERSION_ID="7"
+PRETTY_NAME="CentOS Linux 7 (Core)"
+ANSI_COLOR="0;31"
+CPE_NAME="cpe:/o:centos:centos:7"
+HOME_URL="https://www.centos.org/"
+BUG_REPORT_URL="https://bugs.centos.org/"
+
+CENTOS_MANTISBT_PROJECT="CentOS-7"
+CENTOS_MANTISBT_PROJECT_VERSION="7"
+REDHAT_SUPPORT_PRODUCT="centos"
+REDHAT_SUPPORT_PRODUCT_VERSION="7"`
+	err := ioutil.WriteFile(mockOSRelease, []byte(dump), 0644)
+	c.Assert(err, IsNil)
+
+	reset := release.MockOSReleasePath(mockOSRelease)
+	defer reset()
+
+	os := release.ReadOSRelease()
+	c.Check(os.ID, Equals, "centos")
+	c.Check(os.VersionID, Equals, "7")
+	c.Check(os.IDLike, DeepEquals, []string{"rhel", "fedora"})
+}
+
+func (s *ReleaseTestSuite) TestReadOSReleaseNotFound(c *C) {
+	reset := release.MockOSReleasePath("not-there")
+	defer reset()
+
+	os := release.ReadOSRelease()
+	c.Assert(os, DeepEquals, release.OS{ID: "linux"})
+}
+
+func (s *ReleaseTestSuite) TestOnClassic(c *C) {
+	reset := release.MockOnClassic(true)
+	defer reset()
+	c.Assert(release.OnClassic, Equals, true)
+
+	reset = release.MockOnClassic(false)
+	defer reset()
+	c.Assert(release.OnClassic, Equals, false)
+}
+
+func (s *ReleaseTestSuite) TestReleaseInfo(c *C) {
+	reset := release.MockReleaseInfo(&release.OS{
+		ID: "distro-id",
+	})
+	defer reset()
+	c.Assert(release.ReleaseInfo.ID, Equals, "distro-id")
+}
+
+func (s *ReleaseTestSuite) TestNonWSL(c *C) {
+	defer release.MockIoutilReadfile(func(s string) ([]byte, error) {
+		c.Check(s, Equals, "/proc/version")
+		return []byte("Linux version 2.2.19 (herbert@gondolin) (gcc version 2.7.2.3) #1 Wed Mar 20 19:41:41 EST 2002"), nil
+	})()
+
+	c.Check(release.IsWSL(), Equals, false)
+}
+
+func (s *ReleaseTestSuite) TestWSL(c *C) {
+	defer release.MockIoutilReadfile(func(s string) ([]byte, error) {
+		c.Check(s, Equals, "/proc/version")
+		return []byte("Linux version 3.4.0-Microsoft (Microsoft@Microsoft.com) (gcc version 4.7 (GCC) ) #1 SMP PREEMPT Wed Dec 31 14:42:53 PST 2014"), nil
+	})()
+
+	c.Check(release.IsWSL(), Equals, true)
+}
+
+func (s *ReleaseTestSuite) TestSystemctlSupportsUserUnits(c *C) {
+	for _, t := range []struct {
+		id, versionID string
+		supported     bool
+	}{
+		// Non-Ubuntu releases are assumed to be new enough
+		{"distro-id", "version", true},
+		// Ubuntu 14.04's systemd is too old for user units
+		{"ubuntu", "14.04", false},
+		// Other Ubuntu releases are fine
+		{"ubuntu", "16.04", true},
+		{"ubuntu", "18.04", true},
+		{"ubuntu", "20.04", true},
+	} {
+		reset := release.MockReleaseInfo(&release.OS{
+			ID:        t.id,
+			VersionID: t.versionID,
+		})
+		defer reset()
+
+		c.Check(release.SystemctlSupportsUserUnits(), Equals, t.supported)
+	}
 }

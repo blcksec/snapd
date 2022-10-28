@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015 Canonical Ltd
+ * Copyright (C) 2015-2020 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,355 +22,738 @@
 package asserts
 
 import (
-	"errors"
 	"fmt"
-	"io/ioutil"
-	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
-
-	"github.com/ubuntu-core/snappy/helpers"
 )
 
-// PublicKey is a public key as used by the assertion database.
-type PublicKey interface {
-	// Fingerprint returns the key fingerprint.
-	Fingerprint() string
-	// Verify verifies signature is valid for content using the key.
-	Verify(content []byte, sig Signature) error
-	// IsValidAt returns whether the public key is valid at 'when' time.
-	IsValidAt(when time.Time) bool
+// NotFoundError is returned when an assertion can not be found.
+type NotFoundError struct {
+	Type    *AssertionType
+	Headers map[string]string
 }
 
-// TODO/XXX: make PublicKey minimal, only Fingerprint exported
-// have a few more internal only methods, to address encodeOpenpgp for example
-// then for now use AccountKey directly for TrustedKeys in DatabaseConfig
+func (e *NotFoundError) Error() string {
+	pk, err := PrimaryKeyFromHeaders(e.Type, e.Headers)
+	if err != nil || len(e.Headers) != len(pk) {
+		// TODO: worth conveying more information?
+		return fmt.Sprintf("%s assertion not found", e.Type.Name)
+	}
+
+	return fmt.Sprintf("%v not found", &Ref{Type: e.Type, PrimaryKey: pk})
+}
+
+// IsNotFound returns whether err is an assertion not found error.
+func IsNotFound(err error) bool {
+	_, ok := err.(*NotFoundError)
+	return ok
+}
+
+// A Backstore stores assertions. It can store and retrieve assertions
+// by type under unique primary key headers (whose names are available
+// from assertType.PrimaryKey). Plus it supports searching by headers.
+// Lookups can be limited to a maximum allowed format.
+type Backstore interface {
+	// Put stores an assertion.
+	// It is responsible for checking that assert is newer than a
+	// previously stored revision with the same primary key headers.
+	Put(assertType *AssertionType, assert Assertion) error
+	// Get returns the assertion with the given unique key for its
+	// primary key headers.  If none is present it returns a
+	// NotFoundError, usually with omitted Headers.
+	Get(assertType *AssertionType, key []string, maxFormat int) (Assertion, error)
+	// Search returns assertions matching the given headers.
+	// It invokes foundCb for each found assertion.
+	Search(assertType *AssertionType, headers map[string]string, foundCb func(Assertion), maxFormat int) error
+	// SequenceMemberAfter returns for a sequence-forming assertType the
+	// first assertion in the sequence under the given sequenceKey
+	// with sequence number larger than after. If after==-1 it
+	// returns the assertion with largest sequence number. If none
+	// exists it returns a NotFoundError, usually with omitted
+	// Headers. If assertType is not sequence-forming it can
+	// panic.
+	SequenceMemberAfter(assertType *AssertionType, sequenceKey []string, after, maxFormat int) (SequenceMember, error)
+}
+
+type nullBackstore struct{}
+
+func (nbs nullBackstore) Put(t *AssertionType, a Assertion) error {
+	return fmt.Errorf("cannot store assertions without setting a proper assertion backstore implementation")
+}
+
+func (nbs nullBackstore) Get(t *AssertionType, k []string, maxFormat int) (Assertion, error) {
+	return nil, &NotFoundError{Type: t}
+}
+
+func (nbs nullBackstore) Search(t *AssertionType, h map[string]string, f func(Assertion), maxFormat int) error {
+	return nil
+}
+
+func (nbs nullBackstore) SequenceMemberAfter(t *AssertionType, kp []string, after, maxFormat int) (SequenceMember, error) {
+	return nil, &NotFoundError{Type: t}
+}
+
+// A KeypairManager is a manager and backstore for private/public key pairs.
+type KeypairManager interface {
+	// Put stores the given private/public key pair,
+	// making sure it can be later retrieved by its unique key id with Get.
+	// Trying to store a key with an already present key id should
+	// result in an error.
+	Put(privKey PrivateKey) error
+	// Get returns the private/public key pair with the given key id.
+	Get(keyID string) (PrivateKey, error)
+}
 
 // DatabaseConfig for an assertion database.
 type DatabaseConfig struct {
-	// database backstore path
-	Path string
-	// trusted keys maps authority-ids to list of trusted keys.
-	TrustedKeys map[string][]PublicKey
+	// trusted set of assertions (account and account-key supported),
+	// used to establish root keys and trusted authorities
+	Trusted []Assertion
+	// predefined assertions but that do not establish foundational trust
+	OtherPredefined []Assertion
+	// backstore for assertions, left unset storing assertions will error
+	Backstore Backstore
+	// manager/backstore for keypairs, defaults to in-memory implementation
+	KeypairManager KeypairManager
+	// assertion checkers used by Database.Check, left unset DefaultCheckers will be used which is recommended
+	Checkers []Checker
 }
 
-// Well-known errors
-var (
-	ErrNotFound = errors.New("assertion not found")
-)
-
-// A consistencyChecker performs further checks based on the full
-// assertion database knowledge and its own signing key.
-type consistencyChecker interface {
-	checkConsistency(db *Database, signingPubKey PublicKey) error
+// RevisionError indicates a revision improperly used for an operation.
+type RevisionError struct {
+	Used, Current int
 }
+
+func (e *RevisionError) Error() string {
+	if e.Used < 0 || e.Current < 0 {
+		// TODO: message may need tweaking once there's a use.
+		return fmt.Sprintf("assertion revision is unknown")
+	}
+	if e.Used == e.Current {
+		return fmt.Sprintf("revision %d is already the current revision", e.Used)
+	}
+	if e.Used < e.Current {
+		return fmt.Sprintf("revision %d is older than current revision %d", e.Used, e.Current)
+	}
+	return fmt.Sprintf("revision %d is more recent than current revision %d", e.Used, e.Current)
+}
+
+// UnsupportedFormatError indicates an assertion with a format iteration not yet supported by the present version of asserts.
+type UnsupportedFormatError struct {
+	Ref    *Ref
+	Format int
+	// Update marks there was already a current revision of the assertion and it has been kept.
+	Update bool
+}
+
+func (e *UnsupportedFormatError) Error() string {
+	postfx := ""
+	if e.Update {
+		postfx = " (current not updated)"
+	}
+	return fmt.Sprintf("proposed %q assertion has format %d but %d is latest supported%s", e.Ref.Type.Name, e.Format, e.Ref.Type.MaxSupportedFormat(), postfx)
+}
+
+// IsUnaccceptedUpdate returns whether the error indicates that an
+// assertion revision was already present and has been kept because
+// the update was not accepted.
+func IsUnaccceptedUpdate(err error) bool {
+	switch x := err.(type) {
+	case *UnsupportedFormatError:
+		return x.Update
+	case *RevisionError:
+		return x.Used <= x.Current
+	}
+	return false
+}
+
+// A RODatabase exposes read-only access to an assertion database.
+type RODatabase interface {
+	// IsTrustedAccount returns whether the account is part of the trusted set.
+	IsTrustedAccount(accountID string) bool
+	// Find an assertion based on arbitrary headers.
+	// Provided headers must contain the primary key for the assertion type.
+	// It returns a NotFoundError if the assertion cannot be found.
+	Find(assertionType *AssertionType, headers map[string]string) (Assertion, error)
+	// FindPredefined finds an assertion in the predefined sets
+	// (trusted or not) based on arbitrary headers.  Provided
+	// headers must contain the primary key for the assertion
+	// type.  It returns a NotFoundError if the assertion cannot
+	// be found.
+	FindPredefined(assertionType *AssertionType, headers map[string]string) (Assertion, error)
+	// FindTrusted finds an assertion in the trusted set based on
+	// arbitrary headers.  Provided headers must contain the
+	// primary key for the assertion type.  It returns a
+	// NotFoundError if the assertion cannot be found.
+	FindTrusted(assertionType *AssertionType, headers map[string]string) (Assertion, error)
+	// FindMany finds assertions based on arbitrary headers.
+	// It returns a NotFoundError if no assertion can be found.
+	FindMany(assertionType *AssertionType, headers map[string]string) ([]Assertion, error)
+	// FindManyPredefined finds assertions in the predefined sets
+	// (trusted or not) based on arbitrary headers.  It returns a
+	// NotFoundError if no assertion can be found.
+	FindManyPredefined(assertionType *AssertionType, headers map[string]string) ([]Assertion, error)
+	// Check tests whether the assertion is properly signed and consistent with all the stored knowledge.
+	Check(assert Assertion) error
+}
+
+// A Checker defines a check on an assertion considering aspects such as
+// the signing key, and consistency with other
+// assertions in the database.
+type Checker func(assert Assertion, signingKey *AccountKey, roDB RODatabase, checkTime time.Time) error
 
 // Database holds assertions and can be used to sign or check
 // further assertions.
 type Database struct {
-	root string
-	cfg  DatabaseConfig
-}
+	bs         Backstore
+	keypairMgr KeypairManager
 
-const (
-	privateKeysLayoutVersion = "v0"
-	privateKeysRoot          = "private-keys-" + privateKeysLayoutVersion
-	assertionsLayoutVersion  = "v0"
-	assertionsRoot           = "asserts-" + assertionsLayoutVersion
-)
+	trusted    Backstore
+	predefined Backstore
+	// all backstores to consider for find
+	backstores []Backstore
+	// backstores of dbs this was built on by stacking
+	stackedOn []Backstore
+
+	checkers []Checker
+}
 
 // OpenDatabase opens the assertion database based on the configuration.
 func OpenDatabase(cfg *DatabaseConfig) (*Database, error) {
-	err := os.MkdirAll(cfg.Path, 0775)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create assert database root: %v", err)
-	}
-	info, err := os.Stat(cfg.Path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create assert database root: %v", err)
-	}
-	if info.Mode().Perm()&0002 != 0 {
-		return nil, fmt.Errorf("assert database root unexpectedly world-writable: %v", cfg.Path)
-	}
-	return &Database{root: cfg.Path, cfg: *cfg}, nil
-}
+	bs := cfg.Backstore
+	keypairMgr := cfg.KeypairManager
 
-func (db *Database) atomicWriteEntry(data []byte, secret bool, subpath ...string) error {
-	fpath := filepath.Join(db.root, filepath.Join(subpath...))
-	dir := filepath.Dir(fpath)
-	err := os.MkdirAll(dir, 0775)
-	if err != nil {
-		return err
+	if bs == nil {
+		bs = nullBackstore{}
 	}
-	fperm := 0664
-	if secret {
-		fperm = 0600
-	}
-	return helpers.AtomicWriteFile(fpath, data, os.FileMode(fperm), 0)
-}
-
-func (db *Database) readEntry(subpath ...string) ([]byte, error) {
-	fpath := filepath.Join(db.root, filepath.Join(subpath...))
-	return ioutil.ReadFile(fpath)
-}
-
-// GenerateKey generates a private/public key pair for identity and
-// stores it returning its fingerprint.
-func (db *Database) GenerateKey(authorityID string) (fingerprint string, err error) {
-	// TODO: support specifying different key types/algorithms
-	privKey, err := generatePrivateKey()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate private key: %v", err)
+	if keypairMgr == nil {
+		keypairMgr = NewMemoryKeypairManager()
 	}
 
-	return db.ImportKey(authorityID, OpenPGPPrivateKey(privKey))
-}
+	trustedBackstore := NewMemoryBackstore()
 
-// ImportKey stores the given private/public key pair for identity and
-// returns its fingerprint
-func (db *Database) ImportKey(authorityID string, privKey PrivateKey) (fingerprint string, err error) {
-	encoded, err := encodePrivateKey(privKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to store private key: %v", err)
-	}
+	for _, a := range cfg.Trusted {
+		switch accepted := a.(type) {
+		case *AccountKey:
+			accKey := accepted
+			err := trustedBackstore.Put(AccountKeyType, accKey)
+			if err != nil {
+				return nil, fmt.Errorf("cannot predefine trusted account key %q for %q: %v", accKey.PublicKeyID(), accKey.AccountID(), err)
+			}
 
-	fingerp := privKey.PublicKey().Fingerprint()
-	err = db.atomicWriteEntry(encoded, true, privateKeysRoot, authorityID, fingerp)
-	if err != nil {
-		return "", fmt.Errorf("failed to store private key: %v", err)
-	}
-	return fingerp, nil
-}
-
-// findPrivateKey will return an error if not eactly one private key is found
-func (db *Database) findPrivateKey(authorityID, fingerprintWildcard string) (PrivateKey, error) {
-	keyPath := ""
-	foundPrivKeyCb := func(relpath string) error {
-		if keyPath != "" {
-			return fmt.Errorf("ambiguous search, more than one key pair found: %q and %q", keyPath, relpath)
-
+		case *Account:
+			acct := accepted
+			err := trustedBackstore.Put(AccountType, acct)
+			if err != nil {
+				return nil, fmt.Errorf("cannot predefine trusted account %q: %v", acct.DisplayName(), err)
+			}
+		default:
+			return nil, fmt.Errorf("cannot predefine trusted assertions that are not account-key or account: %s", a.Type().Name)
 		}
-		keyPath = relpath
-		return nil
 	}
-	privKeysTop := filepath.Join(db.root, privateKeysRoot)
-	err := findWildcard(privKeysTop, []string{authorityID, fingerprintWildcard}, foundPrivKeyCb)
-	if err != nil {
-		return nil, err
+
+	otherPredefinedBackstore := NewMemoryBackstore()
+
+	for _, a := range cfg.OtherPredefined {
+		err := otherPredefinedBackstore.Put(a.Type(), a)
+		if err != nil {
+			return nil, fmt.Errorf("cannot predefine assertion %v: %v", a.Ref(), err)
+		}
 	}
-	if keyPath == "" {
-		return nil, fmt.Errorf("no matching key pair found")
+
+	checkers := cfg.Checkers
+	if len(checkers) == 0 {
+		checkers = DefaultCheckers
 	}
-	encoded, err := db.readEntry(privateKeysRoot, keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read key pair: %v", err)
+	dbCheckers := make([]Checker, len(checkers))
+	copy(dbCheckers, checkers)
+
+	return &Database{
+		bs:         bs,
+		keypairMgr: keypairMgr,
+		trusted:    trustedBackstore,
+		predefined: otherPredefinedBackstore,
+		// order here is relevant, Find* precedence and
+		// findAccountKey depend on it, trusted should win over the
+		// general backstore!
+		backstores: []Backstore{trustedBackstore, otherPredefinedBackstore, bs},
+		checkers:   dbCheckers,
+	}, nil
+}
+
+// WithStackedBackstore returns a new database that adds to the given backstore
+// only but finds in backstore and the base database backstores and
+// cross-checks against all of them.
+// This is useful to cross-check a set of assertions without adding
+// them to the database.
+func (db *Database) WithStackedBackstore(backstore Backstore) *Database {
+	// original bs goes in front of stacked-on ones
+	stackedOn := []Backstore{db.bs}
+	stackedOn = append(stackedOn, db.stackedOn...)
+	// find order: trusted, predefined, new backstore, stacked-on ones
+	backstores := []Backstore{db.trusted, db.predefined}
+	backstores = append(backstores, backstore)
+	backstores = append(backstores, stackedOn...)
+	return &Database{
+		bs:         backstore,
+		keypairMgr: db.keypairMgr,
+		trusted:    db.trusted,
+		predefined: db.predefined,
+		backstores: backstores,
+		stackedOn:  stackedOn,
+		checkers:   db.checkers,
 	}
-	privKey, err := decodePrivateKey(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode key pair: %v", err)
-	}
-	return privKey, nil
+}
+
+// ImportKey stores the given private/public key pair.
+func (db *Database) ImportKey(privKey PrivateKey) error {
+	return db.keypairMgr.Put(privKey)
 }
 
 var (
-	// for sanity checking of fingerprint-like strings
-	fingerprintLike = regexp.MustCompile("^[0-9a-f]*$")
+	// for sanity checking of base64 hash strings
+	base64HashLike = regexp.MustCompile("^[[:alnum:]_-]*$")
 )
 
-// PublicKey exports the public part of a stored key pair for identity
-// by matching the given fingerprint suffix, it is an error if no or more
-// than one key pair is found.
-func (db *Database) PublicKey(authorityID string, fingerprintSuffix string) (PublicKey, error) {
-	if !fingerprintLike.MatchString(fingerprintSuffix) {
-		return nil, fmt.Errorf("fingerprint suffix contains unexpected chars: %q", fingerprintSuffix)
+func (db *Database) safeGetPrivateKey(keyID string) (PrivateKey, error) {
+	if keyID == "" {
+		return nil, fmt.Errorf("key id is empty")
 	}
-	privKey, err := db.findPrivateKey(authorityID, "*"+fingerprintSuffix)
+	if !base64HashLike.MatchString(keyID) {
+		return nil, fmt.Errorf("key id contains unexpected chars: %q", keyID)
+	}
+	return db.keypairMgr.Get(keyID)
+}
+
+// PublicKey returns the public key part of the key pair that has the given key id.
+func (db *Database) PublicKey(keyID string) (PublicKey, error) {
+	privKey, err := db.safeGetPrivateKey(keyID)
 	if err != nil {
 		return nil, err
 	}
 	return privKey.PublicKey(), nil
 }
 
-// Sign builds an assertion with the provided information and signs it
-// with the private key from `headers["authority-id"]` that has the provided fingerprint.
-func (db *Database) Sign(assertType AssertionType, headers map[string]string, body []byte, fingerprint string) (Assertion, error) {
-	if fingerprint == "" {
-		return nil, fmt.Errorf("fingerprint is empty")
-	}
-	if !fingerprintLike.MatchString(fingerprint) {
-		return nil, fmt.Errorf("fingerprint contains unexpected chars: %q", fingerprint)
-	}
-	authorityID, err := checkMandatory(headers, "authority-id")
+// Sign assembles an assertion with the provided information and signs it
+// with the private key from `headers["authority-id"]` that has the provided key id.
+func (db *Database) Sign(assertType *AssertionType, headers map[string]interface{}, body []byte, keyID string) (Assertion, error) {
+	privKey, err := db.safeGetPrivateKey(keyID)
 	if err != nil {
 		return nil, err
 	}
-	privKey, err := db.findPrivateKey(authorityID, fingerprint)
-	if err != nil {
-		return nil, err
-	}
-	return buildAndSign(assertType, headers, body, privKey)
+	return assembleAndSign(assertType, headers, body, privKey)
 }
 
-// use a generalized matching style along what PGP does where keys can be
-// retrieved by giving suffixes of their fingerprint,
-// for safety suffix must be at least 64 bits though
-// TODO: may need more details about the kind of key we are looking for
-func (db *Database) findPublicKeys(authorityID, fingerprintSuffix string) ([]PublicKey, error) {
-	suffixLen := len(fingerprintSuffix)
-	if suffixLen%2 == 1 {
-		return nil, fmt.Errorf("key id/fingerprint suffix cannot specify a half byte")
-	}
-	if suffixLen < 16 {
-		return nil, fmt.Errorf("key id/fingerprint suffix must be at least 64 bits")
-	}
-	res := make([]PublicKey, 0, 1)
-	cands := db.cfg.TrustedKeys[authorityID]
-	for _, cand := range cands {
-		if strings.HasSuffix(cand.Fingerprint(), fingerprintSuffix) {
-			res = append(res, cand)
+// findAccountKey finds an AccountKey exactly with account id and key id.
+func (db *Database) findAccountKey(authorityID, keyID string) (*AccountKey, error) {
+	key := []string{keyID}
+	// consider trusted account keys then disk stored account keys
+	for _, bs := range db.backstores {
+		a, err := bs.Get(AccountKeyType, key, AccountKeyType.MaxSupportedFormat())
+		if err == nil {
+			hit := a.(*AccountKey)
+			if hit.AccountID() != authorityID {
+				return nil, fmt.Errorf("found public key %q from %q but expected it from: %s", keyID, hit.AccountID(), authorityID)
+			}
+			return hit, nil
+		}
+		if !IsNotFound(err) {
+			return nil, err
 		}
 	}
-	// consider stored account keys
-	accountKeysTop := filepath.Join(db.root, assertionsRoot, string(AccountKeyType))
-	foundKeyCb := func(primaryPath string) error {
-		a, err := db.readAssertion(AccountKeyType, primaryPath)
-		if err != nil {
-			return err
-		}
-		var accKey PublicKey
-		accKey, ok := a.(*AccountKey)
-		if !ok {
-			return fmt.Errorf("something that is not an account-key under their storage tree")
-		}
-		res = append(res, accKey)
-		return nil
-	}
-	err := findWildcard(accountKeysTop, []string{url.QueryEscape(authorityID), "*" + fingerprintSuffix}, foundKeyCb)
-	if err != nil {
-		return nil, fmt.Errorf("broken assertion storage, scanning: %v", err)
-	}
+	return nil, &NotFoundError{Type: AccountKeyType}
+}
 
-	return res, nil
+// IsTrustedAccount returns whether the account is part of the trusted set.
+func (db *Database) IsTrustedAccount(accountID string) bool {
+	if accountID == "" {
+		return false
+	}
+	_, err := db.trusted.Get(AccountType, []string{accountID}, AccountType.MaxSupportedFormat())
+	return err == nil
 }
 
 // Check tests whether the assertion is properly signed and consistent with all the stored knowledge.
 func (db *Database) Check(assert Assertion) error {
-	content, signature := assert.Signature()
-	sig, err := decodeSignature(signature)
-	if err != nil {
-		return err
+	if !assert.SupportedFormat() {
+		return &UnsupportedFormatError{Ref: assert.Ref(), Format: assert.Format()}
 	}
-	// TODO: later may need to consider type of assert to find candidate keys
-	pubKeys, err := db.findPublicKeys(assert.AuthorityID(), sig.KeyID())
-	if err != nil {
-		return fmt.Errorf("error finding matching public key for signature: %v", err)
-	}
+
+	typ := assert.Type()
 	now := time.Now()
-	var lastErr error
-	for _, pubKey := range pubKeys {
-		if pubKey.IsValidAt(now) {
-			err := pubKey.Verify(content, sig)
-			if err == nil {
-				// see if the assertion requires further checks
-				if checker, ok := assert.(consistencyChecker); ok {
-					err := checker.checkConsistency(db, pubKey)
-					if err != nil {
-						return fmt.Errorf("signature verifies but assertion violates other knownledge: %v", err)
-					}
-				}
-				return nil
-			}
-			lastErr = err
+
+	var accKey *AccountKey
+	var err error
+	if typ.flags&noAuthority == 0 {
+		// TODO: later may need to consider type of assert to find candidate keys
+		accKey, err = db.findAccountKey(assert.AuthorityID(), assert.SignKeyID())
+		if IsNotFound(err) {
+			return fmt.Errorf("no matching public key %q for signature by %q", assert.SignKeyID(), assert.AuthorityID())
+		}
+		if err != nil {
+			return fmt.Errorf("error finding matching public key for signature: %v", err)
+		}
+	} else {
+		if assert.AuthorityID() != "" {
+			return fmt.Errorf("internal error: %q assertion cannot have authority-id set", typ.Name)
 		}
 	}
-	if lastErr == nil {
-		return fmt.Errorf("no valid known public key verifies assertion")
-	}
-	return fmt.Errorf("failed signature verification: %v", lastErr)
-}
 
-func (db *Database) readAssertion(assertType AssertionType, primaryPath string) (Assertion, error) {
-	encoded, err := db.readEntry(assertionsRoot, string(assertType), primaryPath)
-	if os.IsNotExist(err) {
-		return nil, ErrNotFound
+	for _, checker := range db.checkers {
+		err := checker(assert, accKey, db, now)
+		if err != nil {
+			return err
+		}
 	}
-	if err != nil {
-		return nil, fmt.Errorf("broken assertion storage, failed to read assertion: %v", err)
-	}
-	assert, err := Decode(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("broken assertion storage, failed to decode assertion: %v", err)
-	}
-	return assert, nil
+
+	return nil
 }
 
 // Add persists the assertion after ensuring it is properly signed and consistent with all the stored knowledge.
 // It will return an error when trying to add an older revision of the assertion than the one currently stored.
 func (db *Database) Add(assert Assertion) error {
-	reg, err := checkAssertType(assert.Type())
+	ref := assert.Ref()
+
+	if len(ref.PrimaryKey) == 0 {
+		return fmt.Errorf("internal error: assertion type %q has no primary key", ref.Type.Name)
+	}
+
+	err := db.Check(assert)
 	if err != nil {
+		if ufe, ok := err.(*UnsupportedFormatError); ok {
+			_, err := ref.Resolve(db.Find)
+			if err != nil && !IsNotFound(err) {
+				return err
+			}
+			return &UnsupportedFormatError{Ref: ufe.Ref, Format: ufe.Format, Update: err == nil}
+		}
 		return err
 	}
-	err = db.Check(assert)
-	if err != nil {
-		return err
-	}
-	primaryKey := make([]string, len(reg.primaryKey))
-	for i, k := range reg.primaryKey {
-		keyVal := assert.Header(k)
+
+	for i, keyVal := range ref.PrimaryKey {
 		if keyVal == "" {
-			return fmt.Errorf("missing primary key header: %v", k)
+			return fmt.Errorf("missing or non-string primary key header: %v", ref.Type.PrimaryKey[i])
 		}
-		// safety against '/' etc
-		primaryKey[i] = url.QueryEscape(keyVal)
 	}
-	primaryPath := filepath.Join(primaryKey...)
-	curAssert, err := db.readAssertion(assert.Type(), primaryPath)
-	if err == nil {
-		curRev := curAssert.Revision()
-		rev := assert.Revision()
-		if curRev >= rev {
-			return fmt.Errorf("assertion added must have more recent revision than current one (adding %d, currently %d)", rev, curRev)
+
+	// assuming trusted account keys/assertions will be managed
+	// through the os snap this seems the safest policy until we
+	// know more/better
+	_, err = db.trusted.Get(ref.Type, ref.PrimaryKey, ref.Type.MaxSupportedFormat())
+	if !IsNotFound(err) {
+		return fmt.Errorf("cannot add %q assertion with primary key clashing with a trusted assertion: %v", ref.Type.Name, ref.PrimaryKey)
+	}
+
+	_, err = db.predefined.Get(ref.Type, ref.PrimaryKey, ref.Type.MaxSupportedFormat())
+	if !IsNotFound(err) {
+		return fmt.Errorf("cannot add %q assertion with primary key clashing with a predefined assertion: %v", ref.Type.Name, ref.PrimaryKey)
+	}
+
+	// this is non empty only in the stacked case
+	if len(db.stackedOn) != 0 {
+		headers, err := HeadersFromPrimaryKey(ref.Type, ref.PrimaryKey)
+		if err != nil {
+			return fmt.Errorf("internal error: HeadersFromPrimaryKey for %q failed on prechecked data: %s", ref.Type.Name, ref.PrimaryKey)
 		}
-	} else if err != ErrNotFound {
-		return err
+		cur, err := find(db.stackedOn, ref.Type, headers, -1)
+		if err == nil {
+			curRev := cur.Revision()
+			rev := assert.Revision()
+			if curRev >= rev {
+				return &RevisionError{Current: curRev, Used: rev}
+			}
+		} else if !IsNotFound(err) {
+			return err
+		}
 	}
-	err = db.atomicWriteEntry(Encode(assert), false, assertionsRoot, string(assert.Type()), primaryPath)
+
+	return db.bs.Put(ref.Type, assert)
+}
+
+func searchMatch(assert Assertion, expectedHeaders map[string]string) bool {
+	// check non-primary-key headers as well
+	for expectedKey, expectedValue := range expectedHeaders {
+		if assert.Header(expectedKey) != expectedValue {
+			return false
+		}
+	}
+	return true
+}
+
+func find(backstores []Backstore, assertionType *AssertionType, headers map[string]string, maxFormat int) (Assertion, error) {
+	err := checkAssertType(assertionType)
 	if err != nil {
-		return fmt.Errorf("broken assertion storage, failed to write assertion: %v", err)
+		return nil, err
 	}
-	return nil
+	maxSupp := assertionType.MaxSupportedFormat()
+	if maxFormat == -1 {
+		maxFormat = maxSupp
+	} else {
+		if maxFormat > maxSupp {
+			return nil, fmt.Errorf("cannot find %q assertions for format %d higher than supported format %d", assertionType.Name, maxFormat, maxSupp)
+		}
+	}
+
+	keyValues, err := PrimaryKeyFromHeaders(assertionType, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	var assert Assertion
+	for _, bs := range backstores {
+		a, err := bs.Get(assertionType, keyValues, maxFormat)
+		if err == nil {
+			assert = a
+			break
+		}
+		if !IsNotFound(err) {
+			return nil, err
+		}
+	}
+
+	if assert == nil || !searchMatch(assert, headers) {
+		return nil, &NotFoundError{Type: assertionType, Headers: headers}
+	}
+
+	return assert, nil
 }
 
 // Find an assertion based on arbitrary headers.
 // Provided headers must contain the primary key for the assertion type.
-// It returns ErrNotFound if the assertion cannot be found.
-func (db *Database) Find(assertionType AssertionType, headers map[string]string) (Assertion, error) {
-	reg, err := checkAssertType(assertionType)
+// It returns a NotFoundError if the assertion cannot be found.
+func (db *Database) Find(assertionType *AssertionType, headers map[string]string) (Assertion, error) {
+	return find(db.backstores, assertionType, headers, -1)
+}
+
+// FindMaxFormat finds an assertion like Find but such that its
+// format is <= maxFormat by passing maxFormat along to the backend.
+// It returns a NotFoundError if such an assertion cannot be found.
+func (db *Database) FindMaxFormat(assertionType *AssertionType, headers map[string]string, maxFormat int) (Assertion, error) {
+	return find(db.backstores, assertionType, headers, maxFormat)
+}
+
+// FindPredefined finds an assertion in the predefined sets (trusted
+// or not) based on arbitrary headers.  Provided headers must contain
+// the primary key for the assertion type.  It returns a NotFoundError
+// if the assertion cannot be found.
+func (db *Database) FindPredefined(assertionType *AssertionType, headers map[string]string) (Assertion, error) {
+	return find([]Backstore{db.trusted, db.predefined}, assertionType, headers, -1)
+}
+
+// FindTrusted finds an assertion in the trusted set based on arbitrary headers.
+// Provided headers must contain the primary key for the assertion type.
+// It returns a NotFoundError if the assertion cannot be found.
+func (db *Database) FindTrusted(assertionType *AssertionType, headers map[string]string) (Assertion, error) {
+	return find([]Backstore{db.trusted}, assertionType, headers, -1)
+}
+
+func (db *Database) findMany(backstores []Backstore, assertionType *AssertionType, headers map[string]string) ([]Assertion, error) {
+	err := checkAssertType(assertionType)
 	if err != nil {
 		return nil, err
 	}
-	primaryKey := make([]string, len(reg.primaryKey))
-	for i, k := range reg.primaryKey {
-		keyVal := headers[k]
-		if keyVal == "" {
-			return nil, fmt.Errorf("must provide primary key: %v", k)
-		}
-		primaryKey[i] = url.QueryEscape(keyVal)
+	res := []Assertion{}
+
+	foundCb := func(assert Assertion) {
+		res = append(res, assert)
 	}
-	primaryPath := filepath.Join(primaryKey...)
-	assert, err := db.readAssertion(assertionType, primaryPath)
+
+	// TODO: Find variant taking this
+	maxFormat := assertionType.MaxSupportedFormat()
+	for _, bs := range backstores {
+		err = bs.Search(assertionType, headers, foundCb, maxFormat)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(res) == 0 {
+		return nil, &NotFoundError{Type: assertionType, Headers: headers}
+	}
+	return res, nil
+}
+
+// FindMany finds assertions based on arbitrary headers.
+// It returns a NotFoundError if no assertion can be found.
+func (db *Database) FindMany(assertionType *AssertionType, headers map[string]string) ([]Assertion, error) {
+	return db.findMany(db.backstores, assertionType, headers)
+}
+
+// FindManyPrefined finds assertions in the predefined sets (trusted
+// or not) based on arbitrary headers.  It returns a NotFoundError if
+// no assertion can be found.
+func (db *Database) FindManyPredefined(assertionType *AssertionType, headers map[string]string) ([]Assertion, error) {
+	return db.findMany([]Backstore{db.trusted, db.predefined}, assertionType, headers)
+}
+
+// FindSequence finds an assertion for the given headers and after for
+// a sequence-forming type.
+// The provided headers must contain a sequence key, i.e. a prefix of
+// the primary key for the assertion type except for the sequence
+// number header.
+// The assertion is the first in the sequence under the sequence key
+// with sequence number > after.
+// If after is -1 it returns instead the assertion with the largest
+// sequence number.
+// It will constraint itself to assertions with format <= maxFormat
+// unless maxFormat is -1.
+// It returns a NotFoundError if the assertion cannot be found.
+func (db *Database) FindSequence(assertType *AssertionType, sequenceHeaders map[string]string, after, maxFormat int) (SequenceMember, error) {
+	err := checkAssertType(assertType)
 	if err != nil {
 		return nil, err
 	}
-	// check non-primary-key headers as well
-	for expectedKey, expectedValue := range headers {
-		if assert.Header(expectedKey) != expectedValue {
-			return nil, ErrNotFound
+	if !assertType.SequenceForming() {
+		return nil, fmt.Errorf("cannot use FindSequence with non sequence-forming assertion type %q", assertType.Name)
+	}
+	maxSupp := assertType.MaxSupportedFormat()
+	if maxFormat == -1 {
+		maxFormat = maxSupp
+	} else {
+		if maxFormat > maxSupp {
+			return nil, fmt.Errorf("cannot find %q assertions for format %d higher than supported format %d", assertType.Name, maxFormat, maxSupp)
 		}
 	}
-	return assert, nil
+
+	// form the sequence key using all keys but the last one which
+	// is the sequence number
+	seqKey, err := keysFromHeaders(assertType.PrimaryKey[:len(assertType.PrimaryKey)-1], sequenceHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	// find the better result across backstores' results
+	better := func(cur, a SequenceMember) SequenceMember {
+		if cur == nil {
+			return a
+		}
+		curSeq := cur.Sequence()
+		aSeq := a.Sequence()
+		if after == -1 {
+			if aSeq > curSeq {
+				return a
+			}
+		} else {
+			if aSeq < curSeq {
+				return a
+			}
+		}
+		return cur
+	}
+
+	var assert SequenceMember
+	for _, bs := range db.backstores {
+		a, err := bs.SequenceMemberAfter(assertType, seqKey, after, maxFormat)
+		if err == nil {
+			assert = better(assert, a)
+			continue
+		}
+		if !IsNotFound(err) {
+			return nil, err
+		}
+	}
+
+	if assert != nil {
+		return assert, nil
+	}
+
+	return nil, &NotFoundError{Type: assertType, Headers: sequenceHeaders}
+}
+
+// assertion checkers
+
+// CheckSigningKeyIsNotExpired checks that the signing key is not expired.
+func CheckSigningKeyIsNotExpired(assert Assertion, signingKey *AccountKey, roDB RODatabase, checkTime time.Time) error {
+	if signingKey == nil {
+		// assert isn't signed with an account-key key, CheckSignature
+		// will fail anyway unless we teach it more stuff,
+		// Also this check isn't so relevant for self-signed asserts
+		// (e.g. account-key-request)
+		return nil
+	}
+	if !signingKey.isKeyValidAt(checkTime) {
+		return fmt.Errorf("assertion is signed with expired public key %q from %q", assert.SignKeyID(), assert.AuthorityID())
+	}
+	return nil
+}
+
+// CheckSignature checks that the signature is valid.
+func CheckSignature(assert Assertion, signingKey *AccountKey, roDB RODatabase, checkTime time.Time) error {
+	var pubKey PublicKey
+	if signingKey != nil {
+		pubKey = signingKey.publicKey()
+		if assert.AuthorityID() != signingKey.AccountID() {
+			return fmt.Errorf("assertion authority %q does not match public key from %q", assert.AuthorityID(), signingKey.AccountID())
+		}
+	} else {
+		custom, ok := assert.(customSigner)
+		if !ok {
+			return fmt.Errorf("cannot check no-authority assertion type %q", assert.Type().Name)
+		}
+		pubKey = custom.signKey()
+	}
+	content, encSig := assert.Signature()
+	signature, err := decodeSignature(encSig)
+	if err != nil {
+		return err
+	}
+	err = pubKey.verify(content, signature)
+	if err != nil {
+		return fmt.Errorf("failed signature verification: %v", err)
+	}
+	return nil
+}
+
+type timestamped interface {
+	Timestamp() time.Time
+}
+
+// CheckTimestampVsSigningKeyValidity verifies that the timestamp of
+// the assertion is within the signing key validity.
+func CheckTimestampVsSigningKeyValidity(assert Assertion, signingKey *AccountKey, roDB RODatabase, checkTime time.Time) error {
+	if signingKey == nil {
+		// assert isn't signed with an account-key key, CheckSignature
+		// will fail anyway unless we teach it more stuff.
+		// Also this check isn't so relevant for self-signed asserts
+		// (e.g. account-key-request)
+		return nil
+	}
+	if tstamped, ok := assert.(timestamped); ok {
+		checkTime := tstamped.Timestamp()
+		if !signingKey.isKeyValidAt(checkTime) {
+			until := ""
+			if !signingKey.Until().IsZero() {
+				until = fmt.Sprintf(" until %q", signingKey.Until())
+			}
+			return fmt.Errorf("%s assertion timestamp outside of signing key validity (key valid since %q%s)", assert.Type().Name, signingKey.Since(), until)
+		}
+	}
+	return nil
+}
+
+// XXX: keeping these in this form until we know better
+
+// A consistencyChecker performs further checks based on the full
+// assertion database knowledge and its own signing key.
+type consistencyChecker interface {
+	checkConsistency(roDB RODatabase, signingKey *AccountKey) error
+}
+
+// CheckCrossConsistency verifies that the assertion is consistent with the other statements in the database.
+func CheckCrossConsistency(assert Assertion, signingKey *AccountKey, roDB RODatabase, checkTime time.Time) error {
+	// see if the assertion requires further checks
+	if checker, ok := assert.(consistencyChecker); ok {
+		return checker.checkConsistency(roDB, signingKey)
+	}
+	return nil
+}
+
+// DefaultCheckers lists the default and recommended assertion
+// checkers used by Database if none are specified in the
+// DatabaseConfig.Checkers.
+var DefaultCheckers = []Checker{
+	CheckSigningKeyIsNotExpired,
+	CheckSignature,
+	CheckTimestampVsSigningKeyValidity,
+	CheckCrossConsistency,
 }

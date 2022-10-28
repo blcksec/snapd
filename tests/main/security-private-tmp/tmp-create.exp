@@ -1,0 +1,15 @@
+#!/usr/bin/expect -f
+
+set timeout 20
+
+spawn bash
+
+# Test private /tmp, allowed access
+spawn su -l -c "$env(SNAP_MOUNT_DIR)/bin/test-snapd-sh.sh" test
+expect "$" {} timeout { exit 1 }
+send "touch /tmp/foo\n"
+send "stat /tmp/foo\n"
+expect {
+    timeout { exit 1 }
+    "File: '/tmp/foo'*Size: 0"
+}

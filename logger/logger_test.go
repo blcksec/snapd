@@ -17,15 +17,22 @@
  *
  */
 
-package logger
+package logger_test
 
 import (
 	"bytes"
-	"fmt"
+	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	. "gopkg.in/check.v1"
+
+	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/testutil"
 )
 
 // Hook up check.v1 into the "go test" runner
@@ -34,101 +41,108 @@ func Test(t *testing.T) { TestingT(t) }
 var _ = Suite(&LogSuite{})
 
 type LogSuite struct {
-	sysbuf *bytes.Buffer
+	logbuf        *bytes.Buffer
+	restoreLogger func()
 }
 
 func (s *LogSuite) SetUpTest(c *C) {
-	c.Assert(logger, Equals, NullLogger)
-
-	// we do not want to pollute syslog in our tests (and sbuild
-	// will also not let us do that)
-	newSyslog = func() (*log.Logger, error) {
-		s.sysbuf = bytes.NewBuffer(nil)
-		return log.New(s.sysbuf, "", SyslogFlags), nil
-	}
+	s.logbuf, s.restoreLogger = logger.MockLogger()
 }
 
 func (s *LogSuite) TearDownTest(c *C) {
-	SetLogger(NullLogger)
-	newSyslog = newSyslogImpl
+	s.restoreLogger()
 }
 
 func (s *LogSuite) TestDefault(c *C) {
-	if logger != nil {
-		SetLogger(nil)
-	}
-	c.Check(logger, IsNil)
+	// env shenanigans
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-	err := SimpleSetup()
-	c.Check(err, IsNil)
-	c.Check(logger, NotNil)
-	SetLogger(nil)
+	oldTerm, hadTerm := os.LookupEnv("TERM")
+	defer func() {
+		if hadTerm {
+			os.Setenv("TERM", oldTerm)
+		} else {
+			os.Unsetenv("TERM")
+		}
+	}()
+
+	if logger.GetLogger() != nil {
+		logger.SetLogger(nil)
+	}
+	c.Check(logger.GetLogger(), IsNil)
+
+	os.Setenv("TERM", "dumb")
+	err := logger.SimpleSetup()
+	c.Assert(err, IsNil)
+	c.Check(logger.GetLogger(), NotNil)
+	c.Check(logger.GetLoggerFlags(), Equals, logger.DefaultFlags)
+
+	os.Unsetenv("TERM")
+	err = logger.SimpleSetup()
+	c.Assert(err, IsNil)
+	c.Check(logger.GetLogger(), NotNil)
+	c.Check(logger.GetLoggerFlags(), Equals, log.Lshortfile)
 }
 
 func (s *LogSuite) TestNew(c *C) {
 	var buf bytes.Buffer
-	l, err := NewConsoleLog(&buf, DefaultFlags)
+	l, err := logger.New(&buf, logger.DefaultFlags)
 	c.Assert(err, IsNil)
 	c.Assert(l, NotNil)
-	c.Check(l.sys, NotNil)
-	c.Check(l.log, NotNil)
 }
 
 func (s *LogSuite) TestDebugf(c *C) {
-	var logbuf bytes.Buffer
-	l, err := NewConsoleLog(&logbuf, DefaultFlags)
-	c.Assert(err, IsNil)
+	logger.Debugf("xyzzy")
+	c.Check(s.logbuf.String(), Equals, "")
+}
 
-	SetLogger(l)
+func (s *LogSuite) TestDebugfEnv(c *C) {
+	os.Setenv("SNAPD_DEBUG", "1")
+	defer os.Unsetenv("SNAPD_DEBUG")
 
-	Debugf("xyzzy")
-	c.Check(s.sysbuf.String(), Matches, `(?m).*logger_test\.go:\d+: DEBUG: xyzzy`)
-	c.Check(logbuf.String(), Equals, "")
+	logger.Debugf("xyzzy")
+	c.Check(s.logbuf.String(), testutil.Contains, `DEBUG: xyzzy`)
 }
 
 func (s *LogSuite) TestNoticef(c *C) {
-	var logbuf bytes.Buffer
-	l, err := NewConsoleLog(&logbuf, DefaultFlags)
-	c.Assert(err, IsNil)
-
-	SetLogger(l)
-
-	Noticef("xyzzy")
-	c.Check(s.sysbuf.String(), Matches, `(?m).*logger_test\.go:\d+: xyzzy`)
-	c.Check(logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: xyzzy`)
+	logger.Noticef("xyzzy")
+	c.Check(s.logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: xyzzy`)
 }
 
 func (s *LogSuite) TestPanicf(c *C) {
-	var logbuf bytes.Buffer
-	l, err := NewConsoleLog(&logbuf, DefaultFlags)
-	c.Assert(err, IsNil)
-
-	SetLogger(l)
-
-	c.Check(func() { Panicf("xyzzy") }, Panics, "xyzzy")
-	c.Check(s.sysbuf.String(), Matches, `(?m).*logger_test\.go:\d+: PANIC xyzzy`)
-	c.Check(logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: PANIC xyzzy`)
+	c.Check(func() { logger.Panicf("xyzzy") }, Panics, "xyzzy")
+	c.Check(s.logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: PANIC xyzzy`)
 }
 
-func (s *LogSuite) TestSyslogFails(c *C) {
-	var logbuf bytes.Buffer
+func (s *LogSuite) TestWithLoggerLock(c *C) {
+	logger.Noticef("xyzzy")
 
-	// pretend syslog is not available (e.g. because of no /dev/log in
-	// a chroot or something)
-	newSyslog = func() (*log.Logger, error) {
-		return nil, fmt.Errorf("nih nih")
-	}
+	called := false
+	logger.WithLoggerLock(func() {
+		called = true
+		c.Check(s.logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: xyzzy`)
+	})
+	c.Check(called, Equals, true)
+}
 
-	// ensure a warning is displayed
-	l, err := NewConsoleLog(&logbuf, DefaultFlags)
+func (s *LogSuite) TestIntegrationDebugFromKernelCmdline(c *C) {
+	// must enable actually checking the command line, because by default the
+	// logger package will skip checking for the kernel command line parameter
+	// if it detects it is in a test because otherwise we would have to mock the
+	// cmdline in many many many more tests that end up using a logger
+	restore := logger.ProcCmdlineMustMock(false)
+	defer restore()
+
+	mockProcCmdline := filepath.Join(c.MkDir(), "proc-cmdline")
+	err := ioutil.WriteFile(mockProcCmdline, []byte("console=tty panic=-1 snapd.debug=1\n"), 0644)
 	c.Assert(err, IsNil)
-	c.Check(logbuf.String(), Matches, `(?m).*:\d+: WARNING: can not create syslog logger`)
+	restore = osutil.MockProcCmdline(mockProcCmdline)
+	defer restore()
 
-	// ensure that even without a syslog the console log works and we
-	// do not crash
-	logbuf.Reset()
-	SetLogger(l)
-	Noticef("I do not want to crash")
-	c.Check(logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: I do not want to crash`)
-
+	var buf bytes.Buffer
+	l, err := logger.New(&buf, logger.DefaultFlags)
+	c.Assert(err, IsNil)
+	l.Debug("xyzzy")
+	c.Check(buf.String(), testutil.Contains, `DEBUG: xyzzy`)
 }

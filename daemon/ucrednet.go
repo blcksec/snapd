@@ -23,48 +23,86 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
-	"strings"
+	"sync"
 	sys "syscall"
 )
 
-var errNoUID = errors.New("no uid found")
+var errNoID = errors.New("no pid/uid found")
 
-const ucrednetNobody = uint32((1 << 32) - 1)
+const (
+	ucrednetNoProcess = int32(0)
+	ucrednetNobody    = uint32((1 << 32) - 1)
+)
 
-func ucrednetGetUID(remoteAddr string) (uint32, error) {
-	idx := strings.IndexByte(remoteAddr, ';')
-	if !strings.HasPrefix(remoteAddr, "uid=") || idx < 5 {
-		return ucrednetNobody, errNoUID
+var raddrRegexp = regexp.MustCompile(`^pid=(\d+);uid=(\d+);socket=([^;]*);$`)
+
+var ucrednetGet = ucrednetGetImpl
+
+func ucrednetGetImpl(remoteAddr string) (pid int32, uid uint32, socket string, err error) {
+	// NOTE treat remoteAddr at one point included a user-controlled
+	// string. In case that happens again by accident, treat it as tainted,
+	// and be very suspicious of it.
+	pid = ucrednetNoProcess
+	uid = ucrednetNobody
+	subs := raddrRegexp.FindStringSubmatch(remoteAddr)
+	if subs != nil {
+		if v, err := strconv.ParseInt(subs[1], 10, 32); err == nil {
+			pid = int32(v)
+		}
+		if v, err := strconv.ParseUint(subs[2], 10, 32); err == nil {
+			uid = uint32(v)
+		}
+		socket = subs[3]
+	}
+	if pid == ucrednetNoProcess || uid == ucrednetNobody {
+		err = errNoID
 	}
 
-	uid, err := strconv.ParseUint(remoteAddr[4:idx], 10, 32)
-	if err != nil {
-		return ucrednetNobody, err
-	}
+	return pid, uid, socket, err
+}
 
-	return uint32(uid), nil
+type ucrednet struct {
+	pid    int32
+	uid    uint32
+	socket string
+}
+
+func (un *ucrednet) String() string {
+	if un == nil {
+		return "pid=;uid=;socket=;"
+	}
+	return fmt.Sprintf("pid=%d;uid=%d;socket=%s;", un.pid, un.uid, un.socket)
 }
 
 type ucrednetAddr struct {
 	net.Addr
-	uid string
+	*ucrednet
 }
 
 func (wa *ucrednetAddr) String() string {
-	return fmt.Sprintf("uid=%s;%s", wa.uid, wa.Addr)
+	// NOTE we drop the original (user-supplied) net.Addr from the
+	// serialization entirely. We carry it this far so it helps debugging
+	// (via %#v logging), but from here on in it's not helpful.
+	return wa.ucrednet.String()
 }
 
 type ucrednetConn struct {
 	net.Conn
-	uid string
+	*ucrednet
 }
 
 func (wc *ucrednetConn) RemoteAddr() net.Addr {
-	return &ucrednetAddr{wc.Conn.RemoteAddr(), wc.uid}
+	return &ucrednetAddr{wc.Conn.RemoteAddr(), wc.ucrednet}
 }
 
-type ucrednetListener struct{ net.Listener }
+type ucrednetListener struct {
+	net.Listener
+
+	idempotClose sync.Once
+	closeErr     error
+}
 
 var getUcred = sys.GetsockoptUcred
 
@@ -74,20 +112,33 @@ func (wl *ucrednetListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	uid := ""
+	var unet *ucrednet
 	if ucon, ok := con.(*net.UnixConn); ok {
 		f, err := ucon.File()
 		if err != nil {
 			return nil, err
 		}
+		// File() is a dup(); needs closing
+		defer f.Close()
 
 		ucred, err := getUcred(int(f.Fd()), sys.SOL_SOCKET, sys.SO_PEERCRED)
 		if err != nil {
 			return nil, err
 		}
 
-		uid = strconv.FormatUint(uint64(ucred.Uid), 10)
+		unet = &ucrednet{
+			pid:    ucred.Pid,
+			uid:    ucred.Uid,
+			socket: ucon.LocalAddr().String(),
+		}
 	}
 
-	return &ucrednetConn{con, uid}, err
+	return &ucrednetConn{con, unet}, nil
+}
+
+func (wl *ucrednetListener) Close() error {
+	wl.idempotClose.Do(func() {
+		wl.closeErr = wl.Listener.Close()
+	})
+	return wl.closeErr
 }

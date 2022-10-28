@@ -1,0 +1,29 @@
+summary: check the container validator logs on error
+
+environment:
+    SNAP: test-snapd-validate-container-failures
+
+prepare: |
+    # git doesn't preserve permissions properly :-(
+    p="$TESTSLIB/snaps/$SNAP"
+    # sets up all the permissions, so I don't have to remember which
+    # ones it does preserve (it basically mangles everything anyway)
+    chmod 0600 "$p/comp.sh"
+    chmod 0644 "$p/bin/bar"
+    chmod 0700 "$p/bin/foo"
+    chmod 0    "$p/meta/unreadable"
+    chmod 0644 "$p/meta/hooks/what"
+
+execute: |
+    echo "Snap refuses to install"
+    not snap try "$TESTSLIB/snaps/$SNAP" 2>error.log
+    echo "The error tells you to ask the dev"
+    tr -s '\n ' ' ' < error.log | MATCH 'contact developer'
+
+    echo "And the journal counts the ways"
+    "$TESTSTOOLS"/journal-state match-log '"comp.sh" should be world-readable' -u snapd
+    "$TESTSTOOLS"/journal-state match-log '"bin/bar" should be executable' -u snapd
+    "$TESTSTOOLS"/journal-state match-log '"bin/foo" should be world-readable and executable' -u snapd
+    "$TESTSTOOLS"/journal-state match-log '"meta/unreadable" should be world-readable' -u snapd
+    "$TESTSTOOLS"/journal-state match-log '"meta/hooks/what" should be executable' -u snapd
+    "$TESTSTOOLS"/journal-state match-log '"bin/stahp" does not exist' -u snapd

@@ -1,0 +1,37 @@
+summary: Run project static and unit tests
+
+# Start before anything else as it takes a long time.
+priority: 1000
+
+restore: |
+    rm -rf /tmp/static-unit-tests
+
+execute: |
+    mkdir -p /tmp/static-unit-tests/src/github.com/snapcore
+    cp -ar "$PROJECT_PATH" /tmp/static-unit-tests/src/github.com/snapcore
+    chown -R test:12345 /tmp/static-unit-tests
+
+    # remove leftovers
+    rm -r /tmp/static-unit-tests/src/github.com/snapcore/snapd/vendor/*/
+    rm -rf /tmp/static-unit-tests/src/github.com/snapcore/snapd/cmd/{autom4te.cache,configure,test-driver,config.status,config.guess,config.sub,config.h.in,compile,install-sh,depcomp,build,missing,aclocal.m4,Makefile,Makefile.in}
+
+    # The format of code produced by "gofmt" drifts over time. Perform checks
+    # only on a fixed version to avoid hair-pulling annoyance every six months.
+    if not os.query is-xenial; then
+        skip='SKIP_GOFMT=1'
+    fi
+
+    if [[ -n "${SKIP_NAKEDRET:-}" ]]; then
+        skip="${skip:-} SKIP_NAKEDRET=1"
+    fi
+
+    su -l -c "cd /tmp/static-unit-tests/src/github.com/snapcore/snapd && \
+        PATH=$PATH GOPATH=/tmp/static-unit-tests \
+        ${skip:-} \
+        ./run-checks --static" test
+
+    su -l -c "cd /tmp/static-unit-tests/src/github.com/snapcore/snapd && \
+        PATH=$PATH \
+        GOPATH=/tmp/static-unit-tests \
+        SKIP_COVERAGE=1 \
+        ./run-checks --unit" test

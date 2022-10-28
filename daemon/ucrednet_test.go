@@ -52,13 +52,15 @@ func (s *ucrednetSuite) TearDownSuite(c *check.C) {
 }
 
 func (s *ucrednetSuite) TestAcceptConnRemoteAddrString(c *check.C) {
-	s.ucred = &sys.Ucred{Uid: 42}
+	s.ucred = &sys.Ucred{Pid: 100, Uid: 42}
 	d := c.MkDir()
 	sock := filepath.Join(d, "sock")
 
 	l, err := net.Listen("unix", sock)
 	c.Assert(err, check.IsNil)
-	defer l.Close()
+	wl := &ucrednetListener{Listener: l}
+
+	defer wl.Close()
 
 	go func() {
 		cli, err := net.Dial("unix", sock)
@@ -66,15 +68,14 @@ func (s *ucrednetSuite) TestAcceptConnRemoteAddrString(c *check.C) {
 		cli.Close()
 	}()
 
-	wl := &ucrednetListener{l}
-
 	conn, err := wl.Accept()
 	c.Assert(err, check.IsNil)
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
-	c.Check(remoteAddr, check.Matches, "uid=42;.*")
-	uid, err := ucrednetGetUID(remoteAddr)
+	c.Check(remoteAddr, check.Matches, "pid=100;uid=42;.*")
+	pid, uid, _, err := ucrednetGet(remoteAddr)
+	c.Check(pid, check.Equals, int32(100))
 	c.Check(uid, check.Equals, uint32(42))
 	c.Check(err, check.IsNil)
 }
@@ -82,7 +83,9 @@ func (s *ucrednetSuite) TestAcceptConnRemoteAddrString(c *check.C) {
 func (s *ucrednetSuite) TestNonUnix(c *check.C) {
 	l, err := net.Listen("tcp", "localhost:0")
 	c.Assert(err, check.IsNil)
-	defer l.Close()
+
+	wl := &ucrednetListener{Listener: l}
+	defer wl.Close()
 
 	addr := l.Addr().String()
 
@@ -92,21 +95,20 @@ func (s *ucrednetSuite) TestNonUnix(c *check.C) {
 		cli.Close()
 	}()
 
-	wl := &ucrednetListener{l}
-
 	conn, err := wl.Accept()
 	c.Assert(err, check.IsNil)
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
-	c.Check(remoteAddr, check.Matches, "uid=;.*")
-	uid, err := ucrednetGetUID(remoteAddr)
+	c.Check(remoteAddr, check.Matches, "pid=;uid=;.*")
+	pid, uid, _, err := ucrednetGet(remoteAddr)
+	c.Check(pid, check.Equals, ucrednetNoProcess)
 	c.Check(uid, check.Equals, ucrednetNobody)
-	c.Check(err, check.Equals, errNoUID)
+	c.Check(err, check.Equals, errNoID)
 }
 
 func (s *ucrednetSuite) TestAcceptErrors(c *check.C) {
-	s.ucred = &sys.Ucred{Uid: 42}
+	s.ucred = &sys.Ucred{Pid: 100, Uid: 42}
 	d := c.MkDir()
 	sock := filepath.Join(d, "sock")
 
@@ -114,7 +116,7 @@ func (s *ucrednetSuite) TestAcceptErrors(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Assert(l.Close(), check.IsNil)
 
-	wl := &ucrednetListener{l}
+	wl := &ucrednetListener{Listener: l}
 
 	_, err = wl.Accept()
 	c.Assert(err, check.NotNil)
@@ -127,7 +129,9 @@ func (s *ucrednetSuite) TestUcredErrors(c *check.C) {
 
 	l, err := net.Listen("unix", sock)
 	c.Assert(err, check.IsNil)
-	defer l.Close()
+
+	wl := &ucrednetListener{Listener: l}
+	defer wl.Close()
 
 	go func() {
 		cli, err := net.Dial("unix", sock)
@@ -135,38 +139,63 @@ func (s *ucrednetSuite) TestUcredErrors(c *check.C) {
 		cli.Close()
 	}()
 
-	wl := &ucrednetListener{l}
-
 	_, err = wl.Accept()
 	c.Assert(err, check.Equals, s.err)
 }
 
+func (s *ucrednetSuite) TestIdempotentClose(c *check.C) {
+	s.ucred = &sys.Ucred{Pid: 100, Uid: 42}
+	d := c.MkDir()
+	sock := filepath.Join(d, "sock")
+
+	l, err := net.Listen("unix", sock)
+	c.Assert(err, check.IsNil)
+	wl := &ucrednetListener{Listener: l}
+
+	c.Assert(wl.Close(), check.IsNil)
+	c.Assert(wl.Close(), check.IsNil)
+}
+
 func (s *ucrednetSuite) TestGetNoUid(c *check.C) {
-	uid, err := ucrednetGetUID("uid=;")
-	c.Check(err, check.Equals, errNoUID)
+	pid, uid, _, err := ucrednetGet("pid=100;uid=;socket=;")
+	c.Check(err, check.Equals, errNoID)
+	c.Check(pid, check.Equals, ucrednetNoProcess)
 	c.Check(uid, check.Equals, ucrednetNobody)
 }
 
 func (s *ucrednetSuite) TestGetBadUid(c *check.C) {
-	uid, err := ucrednetGetUID("uid=hello;")
+	pid, uid, _, err := ucrednetGet("pid=100;uid=4294967296;socket=;")
 	c.Check(err, check.NotNil)
+	c.Check(pid, check.Equals, int32(100))
 	c.Check(uid, check.Equals, ucrednetNobody)
 }
 
 func (s *ucrednetSuite) TestGetNonUcrednet(c *check.C) {
-	uid, err := ucrednetGetUID("hello")
-	c.Check(err, check.Equals, errNoUID)
+	pid, uid, _, err := ucrednetGet("hello")
+	c.Check(err, check.Equals, errNoID)
+	c.Check(pid, check.Equals, ucrednetNoProcess)
 	c.Check(uid, check.Equals, ucrednetNobody)
 }
 
 func (s *ucrednetSuite) TestGetNothing(c *check.C) {
-	uid, err := ucrednetGetUID("")
-	c.Check(err, check.Equals, errNoUID)
+	pid, uid, _, err := ucrednetGet("")
+	c.Check(err, check.Equals, errNoID)
+	c.Check(pid, check.Equals, ucrednetNoProcess)
 	c.Check(uid, check.Equals, ucrednetNobody)
 }
 
 func (s *ucrednetSuite) TestGet(c *check.C) {
-	uid, err := ucrednetGetUID("uid=42;")
+	pid, uid, socket, err := ucrednetGet("pid=100;uid=42;socket=/run/snap.socket;")
 	c.Check(err, check.IsNil)
+	c.Check(pid, check.Equals, int32(100))
 	c.Check(uid, check.Equals, uint32(42))
+	c.Check(socket, check.Equals, "/run/snap.socket")
+}
+
+func (s *ucrednetSuite) TestGetSneak(c *check.C) {
+	pid, uid, socket, err := ucrednetGet("pid=100;uid=42;socket=/run/snap.socket;pid=0;uid=0;socket=/tmp/my.socket")
+	c.Check(err, check.Equals, errNoID)
+	c.Check(pid, check.Equals, ucrednetNoProcess)
+	c.Check(uid, check.Equals, ucrednetNobody)
+	c.Check(socket, check.Equals, "")
 }

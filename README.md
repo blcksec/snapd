@@ -1,119 +1,75 @@
-[![Build Status][travis-image]][travis-url] [![Coverage Status][coveralls-image]][coveralls-url]
-# snappy
+[![Snapcraft](https://avatars2.githubusercontent.com/u/19532717?s=200)](https://snapcraft.io)
 
-Snappy is part of Ubuntu Core and enables a fully transactional Ubuntu system.
+# Welcome to snapd
 
-## Development
+This is the code repository for **snapd**, the background service that manages
+and maintains installed snaps. 
 
-### Setting up a GOPATH
+Snaps are app packages for desktop, cloud and IoT that update automatically,
+are easy to install, secure, cross-platform and dependency-free. They're being
+used on millions of Linux systems every day.
 
-When working with the source of Go programs, you should define a path within
-your home directory (or other workspace) which will be your `GOPATH`. `GOPATH`
-is similar to Java's `CLASSPATH` or Python's `~/.local`. `GOPATH` is documented
-[http://golang.org/pkg/go/build/](online) and inside the go tool itself
+Alongside its various service and management functions, snapd:
+- provides the _snap_ command that's used to install and remove snaps and
+  interact with the wider snap ecosystem
+- implements the confinement policies that isolate snaps from the base system
+  and from each other
+- governs the interfaces that allow snaps to access specific system resources
+  outside of their confinement
 
-    go help gopath
+For general details, including
+[installation](https://snapcraft.io/docs/installing-snapd) and [Getting
+started](https://snapcraft.io/docs/getting-started) guides, head over to our
+[Snap documentation](https://snapcraft.io/docs). If you're looking for
+something to install, such as [Spotify](https://snapcraft.io/spotify) or
+[Visual Studio Code](https://snapcraft.io/code), take a look at the [Snap
+Store](https://snapcraft.io/store). And if you want to build your own snaps,
+start with our [Creating a snap](https://snapcraft.io/docs/creating-a-snap)
+documentation.
 
-Various conventions exist for naming the location of your `GOPATH`, but it
-should exist, and be writable by you. For example
+## Get involved
 
-    export GOPATH=${HOME}/work mkdir $GOPATH
+This is an [open source](COPYING) project and we warmly welcome community
+contributions, suggestions, and constructive feedback. If you're interested in
+contributing, please take a look at our [Code of Conduct](CODE_OF_CONDUCT.md)
+first.
 
-will define and create `$HOME/work` as your local `GOPATH`. The `go` tool
-itself will create three subdirectories inside your `GOPATH` when required;
-`src`, `pkg` and `bin`, which hold the source of Go programs, compiled packages
-and compiled binaries, respectively.
+- to report an issue, please file [a bug
+  report](https://bugs.launchpad.net/snappy/+filebug) on our [Launchpad issue
+tracker](https://bugs.launchpad.net/snappy/)
+- for suggestions and constructive feedback, create a post on the [Snapcraft
+  forum](https://forum.snapcraft.io/c/snapd)
+- to build snapd manually, or to get started with snapd development, see
+  [HACKING.md](HACKING.md)
 
-Setting `GOPATH` correctly is critical when developing Go programs. Set and
-export it as part of your login script.
+## Get in touch
 
-Add `$GOPATH/bin` to your `PATH`, so you can run the go programs you install:
+We're friendly! We have a community forum at
+[https://forum.snapcraft.io](https://forum.snapcraft.io) where we discuss
+feature plans, development news, issues, updates and troubleshooting. You can
+chat in realtime with the snapd team and our wider community on the
+[#snappy](https://webchat.freenode.net/?channels=snappy) IRC channel on
+[freenode](https://freenode.net/).
 
-    PATH="$PATH:$GOPATH/bin"
+For news and updates, follow us on [Twitter](https://twitter.com/snapcraftio)
+and on [Facebook](https://www.facebook.com/snapcraftio).
 
-### Getting the snappy sources
+## Project status
 
-The easiest way to get the source for `snappy` is to use the `go get` command.
+| Service | Status |
+|-----|:---|
+| [Travis](https://travis-ci.org/) |  ![Build Status][travis-image]  |
+| [GoReport](https://goreportcard.com/) |  [![Go Report Card][goreportcard-image]][goreportcard-url] |
+| [Codecov](https://codecov.io/) |  [![codecov][codecov-image]][codecov-url] |
 
-    go get -d -v github.com/ubuntu-core/snappy/...
+[travis-image]: https://travis-ci.org/snapcore/snapd.svg?branch=master
+[travis-url]: https://travis-ci.org/snapcore/snapd
 
-This command will checkout the source of `snappy` and inspect it for any unmet
-Go package dependencies, downloading those as well. `go get` will also build
-and install `snappy` and its dependencies. To checkout without installing, use
-the `-d` flag. More details on the `go get` flags are available using
+[goreportcard-image]: https://goreportcard.com/badge/github.com/snapcore/snapd
+[goreportcard-url]: https://goreportcard.com/report/github.com/snapcore/snapd
 
-    go help get
+[coveralls-image]: https://coveralls.io/repos/snapcore/snapd/badge.svg?branch=master&service=github
+[coveralls-url]: https://coveralls.io/github/snapcore/snapd?branch=master
 
-At this point you will have the git local repository of the `snappy` source at
-`$GOPATH/github.com/ubuntu-core/snappy/snappy`. The source for any
-dependent packages will also be available inside `$GOPATH`.
-
-### Dependencies handling
-
-To generate dependencies.tsv you need `godeps`, so
-
-    go get launchpad.net/godeps
-
-To obtain the correct dependencies for the project, run:
-
-    godeps -t -u dependencies.tsv
-
-If the dependencies need updating
-
-    godeps -t ./... > dependencies.tsv
-
-### Building
-
-To build, once the sources are available and `GOPATH` is set, you can just run
-
-    go build -o /tmp/snappy github.com/ubuntu-core/snappy/cmd/snappy
-
-to get the `snappy` binary in /tmp (or without -o to get it in the current
-working directory). Alternatively:
-
-    go install github.com/ubuntu-core/snappy/...
-
-to have it available in `$GOPATH/bin`
-
-### Contributing
-
-Contributions are always welcome! Please make sure that you sign the
-Canonical contributor licence agreement at
-http://www.ubuntu.com/legal/contributors
-
-Snappy can be found on Github, so in order to fork the source and contribute,
-go to https://github.com/ubuntu-core/snappy. Check out [Github's help
-pages](https://help.github.com/) to find out how to set up your local branch,
-commit changes and create pull requests.
-
-We value good tests, so when you fix a bug or add a new feature we highly
-encourage you to create a test in $source_testing.go. See also the section
-about Testing.
-
-### Testing
-
-To run the various tests that we have to ensure a high quality source just run:
-
-    ./run-checks
-
-This will check if the source format is consistent, that it build, all tests
-work as expected and that "go vet" and "golint" have nothing to complain.
-
-You can run individual test with:
-
-    go test -check.f $testname
-
-If a test hangs, you can enable verbose mode:
-
-   go test -v -check.vv
-
-(or -check.v for less verbose output).
-
-There is more to read about the testing framework on the [website](https://labix.org/gocheck)
-
-
-[travis-image]: https://travis-ci.org/ubuntu-core/snappy.svg?branch=master
-[travis-url]: https://travis-ci.org/ubuntu-core/snappy
-
-[coveralls-image]: https://coveralls.io/repos/ubuntu-core/snappy/badge.svg?branch=master&service=github
-[coveralls-url]: https://coveralls.io/github/ubuntu-core/snappy?branch=master
+[codecov-url]: https://codecov.io/gh/snapcore/snapd
+[codecov-image]: https://codecov.io/gh/snapcore/snapd/branch/master/graph/badge.svg

@@ -20,8 +20,13 @@
 package daemon
 
 import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 
 	"gopkg.in/check.v1"
 )
@@ -34,7 +39,7 @@ func (s *responseSuite) TestRespSetsLocationIfAccepted(c *check.C) {
 	rec := httptest.NewRecorder()
 
 	rsp := &resp{
-		Status: http.StatusAccepted,
+		Status: 202,
 		Result: map[string]interface{}{
 			"resource": "foo/bar",
 		},
@@ -49,7 +54,7 @@ func (s *responseSuite) TestRespSetsLocationIfCreated(c *check.C) {
 	rec := httptest.NewRecorder()
 
 	rsp := &resp{
-		Status: http.StatusCreated,
+		Status: 201,
 		Result: map[string]interface{}{
 			"resource": "foo/bar",
 		},
@@ -64,7 +69,7 @@ func (s *responseSuite) TestRespDoesNotSetLocationIfOther(c *check.C) {
 	rec := httptest.NewRecorder()
 
 	rsp := &resp{
-		Status: http.StatusTeapot,
+		Status: 418, // I'm a teapot
 		Result: map[string]interface{}{
 			"resource": "foo/bar",
 		},
@@ -73,4 +78,62 @@ func (s *responseSuite) TestRespDoesNotSetLocationIfOther(c *check.C) {
 	rsp.ServeHTTP(rec, nil)
 	hdr := rec.Header()
 	c.Check(hdr.Get("Location"), check.Equals, "")
+}
+
+func (s *responseSuite) TestFileResponseSetsContentDisposition(c *check.C) {
+	const filename = "icon.png"
+
+	path := filepath.Join(c.MkDir(), filename)
+	err := ioutil.WriteFile(path, nil, os.ModePerm)
+	c.Check(err, check.IsNil)
+
+	rec := httptest.NewRecorder()
+	rsp := fileResponse(path)
+	req, err := http.NewRequest("GET", "", nil)
+	c.Check(err, check.IsNil)
+
+	rsp.ServeHTTP(rec, req)
+
+	hdr := rec.Header()
+	c.Check(hdr.Get("Content-Disposition"), check.Equals,
+		fmt.Sprintf("attachment; filename=%s", filename))
+}
+
+// Due to how the protocol was defined the result must be sent, even if it is
+// null. Older clients rely on this.
+func (s *responseSuite) TestRespJSONWithNullResult(c *check.C) {
+	rj := &respJSON{Result: nil}
+	data, err := json.Marshal(rj)
+	c.Assert(err, check.IsNil)
+	c.Check(string(data), check.Equals, `{"type":"","status-code":0,"status":"","result":null}`)
+}
+
+func (responseSuite) TestErrorResponderPrintfsWithArgs(c *check.C) {
+	teapot := makeErrorResponder(418)
+
+	rec := httptest.NewRecorder()
+	rsp := teapot("system memory below %d%%.", 1)
+	req, err := http.NewRequest("GET", "", nil)
+	c.Assert(err, check.IsNil)
+	rsp.ServeHTTP(rec, req)
+
+	var v struct{ Result errorResult }
+	c.Assert(json.NewDecoder(rec.Body).Decode(&v), check.IsNil)
+
+	c.Check(v.Result.Message, check.Equals, "system memory below 1%.")
+}
+
+func (responseSuite) TestErrorResponderDoesNotPrintfAlways(c *check.C) {
+	teapot := makeErrorResponder(418)
+
+	rec := httptest.NewRecorder()
+	rsp := teapot("system memory below 1%.")
+	req, err := http.NewRequest("GET", "", nil)
+	c.Assert(err, check.IsNil)
+	rsp.ServeHTTP(rec, req)
+
+	var v struct{ Result errorResult }
+	c.Assert(json.NewDecoder(rec.Body).Decode(&v), check.IsNil)
+
+	c.Check(v.Result.Message, check.Equals, "system memory below 1%.")
 }
